@@ -1,32 +1,24 @@
 name: Daily price update
-
-# Runs every day at 06:00 UTC, and can also be run on demand from the Actions tab.
 on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch: {}
-
 permissions:
-  contents: write          # lets the job save the updated prices back to the repo
-
+  contents: write
 jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
-      - name: Get the code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install -r scraper/requirements.txt
-
-      - name: Run the scraper
+      - name: Install browser for Playwright
+        run: python -m playwright install chromium --with-deps
+      - name: Run all scrapers
         run: python scraper/scrape.py
-
       - name: Save updated prices
         run: |
           git config user.name  "price-bot"
