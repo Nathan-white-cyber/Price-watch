@@ -363,9 +363,7 @@ def _pw_scrape_categories(store_id, base_url, categories, sleep=2.0, max_pages=5
 
 
 # ================================================================ LUKIEGAMES (Shift4Shop)
-# LukieGames uses Shift4Shop. Category URL structure from site navigation.
 LUKIEGAMES_CATEGORIES = {
-    # slug -> platform label (URLs are lukiegames.com/<slug>)
     "buy-used-nes-nintendo-games-online": "Nintendo NES",
     "buy-used-super-nintendo-snes-games-online": "Super Nintendo",
     "buy-used-nintendo-64-n64": "Nintendo 64",
@@ -393,23 +391,66 @@ LUKIEGAMES_CATEGORIES = {
     "buy-used-sega-game-gear-games-online": "Sega Game Gear",
     "buy-used-sega-master-system-games-online": "Sega Master System",
     "buy-used-atari-2600-games-online": "Atari 2600",
-    "buy-used-atari-7800-games-online": "Atari 7800",
 }
 
-def scrape_lukiegames(sleep=2.0):
-    print("  [lukiegames] scraping with Playwright...")
-    # LukieGames Shift4Shop pagination: .html then _c_X-2.html, _c_X-3.html etc.
-    # Since the URL pattern is complex, we paginate by finding "Next" links.
+# Realistic browser fingerprints to rotate between requests
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
+
+def _make_stealth_context(browser, ua=None):
+    """Create a browser context that looks like a real user."""
+    import random
+    ua = ua or random.choice(USER_AGENTS)
+    context = browser.new_context(
+        user_agent=ua,
+        viewport={"width": random.choice([1280,1366,1440,1920]),
+                  "height": random.choice([768,800,900,1080])},
+        locale="en-US",
+        timezone_id="America/New_York",
+        extra_http_headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    # Mask common headless browser signals
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        window.chrome = {runtime: {}};
+    """)
+    return context
+
+def scrape_lukiegames(sleep=3.0):
+    """Scrape LukieGames with stealth Playwright. Adds long delays to avoid 429."""
+    import random
+    print("  [lukiegames] scraping with stealth Playwright...")
     if not HAS_PLAYWRIGHT:
         print("    Playwright not installed, skipping"); return []
     seen = {}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ])
+        context = _make_stealth_context(browser)
         page = context.new_page()
+
+        # Warm up: visit homepage first like a real user would
+        try:
+            page.goto("https://www.lukiegames.com/", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(random.uniform(2, 4))
+        except:
+            pass
+
         for slug, platform in LUKIEGAMES_CATEGORIES.items():
             url = "https://www.lukiegames.com/%s.html" % slug
             pg = 0
@@ -417,17 +458,25 @@ def scrape_lukiegames(sleep=2.0):
                 pg += 1
                 try:
                     resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    if resp and resp.status == 429:
+                        print("    ! rate limited on %s, waiting 30s..." % slug)
+                        time.sleep(30)
+                        continue
                     if resp and resp.status >= 400:
                         if pg == 1: print("    ! %s returned %d" % (slug, resp.status))
                         break
                 except Exception as e:
-                    print("    ! %s error: %s" % (slug, e)); break
-                time.sleep(2)
+                    print("    ! %s p%d error: %s" % (slug, pg, e)); break
+
+                # Human-like delay: longer between pages
+                time.sleep(random.uniform(3, 6))
+
                 try:
                     products = page.evaluate(EXTRACT_JS)
                 except:
                     break
                 if not products: break
+
                 new_count = 0
                 for prod in products:
                     pid_key = prod.get("prodId") or prod["url"].rstrip("/").split("/")[-1].replace(".html","")
@@ -436,50 +485,135 @@ def scrape_lukiegames(sleep=2.0):
                     seen[pid] = {"id":pid,"name":prod["name"],"store":"lukiegames",
                         "platform":platform,"price":round(prod["price"],2),"url":prod["url"]}
                     new_count += 1
+
                 if new_count == 0: break
+
                 # Find next page link
                 next_url = page.evaluate("""
                     () => {
-                        const links = document.querySelectorAll('a[class*="next"], a[rel="next"], .pagination a');
-                        for (const a of links) {
-                            if (a.textContent.includes('Next') || a.textContent.includes('»') || a.textContent.includes('>'))
-                                return a.href;
-                        }
-                        return null;
+                        const candidates = [
+                            ...document.querySelectorAll('a[rel="next"]'),
+                            ...document.querySelectorAll('a.next'),
+                            ...[...document.querySelectorAll('.pagination a, .pager a')]
+                                .filter(a => /next|»|>/i.test(a.textContent))
+                        ];
+                        return candidates.length ? candidates[0].href : null;
                     }
                 """)
                 url = next_url
-                if sleep: time.sleep(sleep)
+                # Extra pause between pages of same category
+                if url: time.sleep(random.uniform(2, 4))
+
             cat_count = sum(1 for r in seen.values() if r["platform"] == platform)
             if cat_count:
                 print("    %s: %d products" % (platform, cat_count))
+            # Pause between categories
+            time.sleep(random.uniform(2, 5))
+
         browser.close()
     print("    total: %d products" % len(seen))
     return list(seen.values())
 
 
 # ================================================================ DKOLDIES (BigCommerce)
+# Correct URLs verified from live site navigation
 DKOLDIES_CATEGORIES = {
-    "nintendo":"Nintendo NES","super-nintendo":"Super Nintendo",
-    "nintendo-64":"Nintendo 64","gamecube":"Nintendo Gamecube",
-    "wii":"Nintendo Wii","wii-u":"Wii U",
-    "game-boy":"Game Boy","game-boy-color":"Game Boy Color",
-    "game-boy-advance":"Game Boy Advance","ds":"Nintendo DS",
-    "3ds":"Nintendo 3DS",
-    "playstation-1":"PlayStation 1","playstation-2":"PlayStation 2",
-    "playstation-3":"PlayStation 3","psp":"PlayStation Portable",
-    "ps-vita":"PlayStation Vita",
-    "xbox":"Original Xbox","xbox-360":"Xbox 360",
-    "sega-genesis":"Sega Genesis","sega-dreamcast":"Sega Dreamcast",
-    "sega-saturn":"Sega Saturn","sega-game-gear":"Sega Game Gear",
-    "sega-master-system":"Sega Master System",
-    "atari-2600":"Atari 2600","atari-7800":"Atari 7800",
+    "nintendo-nes":     "Nintendo NES",
+    "super-nintendo":   "Super Nintendo",
+    "nintendo-64":      "Nintendo 64",
+    "gamecube":         "Nintendo Gamecube",
+    "wii":              "Nintendo Wii",
+    "wii-u":            "Wii U",
+    "nintendo-switch":  "Nintendo Switch",
+    "game-boy":         "Game Boy",
+    "game-boy-color":   "Game Boy Color",
+    "game-boy-advance": "Game Boy Advance",
+    "nintendo-ds":      "Nintendo DS",
+    "nintendo-3ds":     "Nintendo 3DS",
+    "playstation-1":    "PlayStation 1",
+    "playstation-2":    "PlayStation 2",
+    "playstation-3":    "PlayStation 3",
+    "playstation-4":    "PlayStation 4",
+    "psp":              "PlayStation Portable",
+    "ps-vita":          "PlayStation Vita",
+    "original-xbox":    "Original Xbox",
+    "xbox-360":         "Xbox 360",
+    "xbox-one":         "Xbox One",
+    "genesis":          "Sega Genesis",
+    "dreamcast":        "Sega Dreamcast",
+    "saturn":           "Sega Saturn",
+    "game-gear":        "Sega Game Gear",
+    "atari":            "Atari",
 }
 
-def scrape_dkoldies(sleep=2.0):
-    print("  [dkoldies] scraping with Playwright...")
-    return _pw_scrape_categories("dkoldies", "https://www.dkoldies.com",
-                                  DKOLDIES_CATEGORIES, sleep=sleep)
+def scrape_dkoldies(sleep=3.0):
+    """Scrape DKOldies with stealth Playwright. BigCommerce paginates via ?page=N."""
+    import random
+    print("  [dkoldies] scraping with stealth Playwright...")
+    if not HAS_PLAYWRIGHT:
+        print("    Playwright not installed, skipping"); return []
+    seen = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ])
+        context = _make_stealth_context(browser)
+        page = context.new_page()
+
+        # Warm up on homepage first
+        try:
+            page.goto("https://www.dkoldies.com/", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(random.uniform(3, 5))
+        except:
+            pass
+
+        for slug, platform in DKOLDIES_CATEGORIES.items():
+            pg = 1
+            while pg <= 50:
+                url = "https://www.dkoldies.com/%s/" % slug
+                if pg > 1:
+                    url += "?page=%d" % pg
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    if resp and resp.status == 403:
+                        print("    ! %s still blocked (403), skipping" % slug)
+                        break
+                    if resp and resp.status >= 400:
+                        if pg == 1: print("    ! %s returned %d" % (slug, resp.status))
+                        break
+                except Exception as e:
+                    print("    ! %s p%d: %s" % (slug, pg, e)); break
+
+                time.sleep(random.uniform(3, 5))
+
+                try:
+                    products = page.evaluate(EXTRACT_JS)
+                except:
+                    break
+                if not products: break
+
+                new_count = 0
+                for prod in products:
+                    pid_key = prod.get("prodId") or prod["url"].rstrip("/").rsplit("/",1)[-1]
+                    pid = "dkoldies-%s" % pid_key
+                    if pid in seen: continue
+                    seen[pid] = {"id":pid,"name":prod["name"],"store":"dkoldies",
+                        "platform":platform,"price":round(prod["price"],2),"url":prod["url"]}
+                    new_count += 1
+
+                if new_count == 0: break
+                pg += 1
+                time.sleep(random.uniform(2, 4))
+
+            cat_count = sum(1 for r in seen.values() if r["platform"] == platform)
+            if cat_count:
+                print("    %s: %d products" % (platform, cat_count))
+            time.sleep(random.uniform(2, 5))
+
+        browser.close()
+    print("    total: %d products" % len(seen))
+    return list(seen.values())
 
 
 # ================================================================ SHARED PIPELINE
