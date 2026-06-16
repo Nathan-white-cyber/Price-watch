@@ -15,7 +15,7 @@ the dashboard reads.
 LukieGames and DKOldies have bot protection so they need a real browser.
 """
 
-import json, time, sys, os, datetime, tempfile, re
+import json, time, sys, os, datetime, tempfile, re, inspect
 
 try:
     import requests
@@ -46,6 +46,7 @@ STORES = [
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_JS_PATH = os.path.join(HERE, "..", "docs", "retro-data.js")
 HISTORY_PATH = os.path.join(HERE, "price-history.json")
+SCRAPER_VERSION = "v8-dkoldies-api"
 
 def fetch_json(url):
     r = requests.get(url, headers=HEADERS, timeout=30)
@@ -225,16 +226,17 @@ def scrape_retrovgames(sleep=1.0):
 
 # JavaScript executed inside the browser to extract products from the page.
 # Tries multiple CSS selector patterns common across e-commerce platforms.
-EXTRACT_JS = """
+EXTRACT_JS = r"""
 () => {
   const results = [];
   const seen = new Set();
   // Try many common product card selectors
   const selectors = [
-    'li.product', '.card', '.product-item', '.v-product',
+    'ul.productGrid > li', '.productGrid li.product', 'article.card',
+    'li.product', 'div.product', '.product-item', '.v-product',
     '[class*="productCard"]', '[class*="ProductCard"]',
-    'article.product', '[data-product-id]', '.grid-item--product',
-    '.productGrid .product', '.category-product'
+    'article.product', '[data-product-id]', '[data-entity-id]',
+    '.grid-item--product', '.productGrid .product', '.category-product'
   ];
   let cards = [];
   for (const sel of selectors) {
@@ -266,7 +268,7 @@ EXTRACT_JS = """
     );
     let price = 0;
     for (const pe of priceEls) {
-      const matches = pe.textContent.match(/\\$[\\d,]+\\.?\\d*/g);
+      const matches = pe.textContent.match(/\$[\d,]+\.?\d*/g);
       if (matches && matches.length > 0) {
         const p = parseFloat(matches[matches.length - 1].replace(/[\\$,]/g, ''));
         if (p > 0) { price = p; break; }
@@ -287,113 +289,111 @@ EXTRACT_JS = """
 }
 """
 
-def _pw_scrape_categories(store_id, base_url, categories, sleep=2.0, max_pages=50):
-    """Scrape category pages using Playwright. Returns list of records."""
-    if not HAS_PLAYWRIGHT:
-        print("    Playwright not installed, skipping %s" % store_id)
+# LukieGames uses the SearchSpring widget: products are <article class="ss__result">
+LUKIE_EXTRACT_JS = r"""
+() => {
+  const out = [];
+  document.querySelectorAll('article.ss__result, .ss__result--item').forEach(card => {
+    const nameA = card.querySelector('.ss__result__name a') || card.querySelector('.ss__result__name');
+    const linkA = card.querySelector('.ss__result__name a') || card.querySelector('a.ss__result__image__link') || card.querySelector('a[href]');
+    if (!nameA || !linkA) return;
+    const name = (nameA.textContent || '').trim();
+    const url = linkA.href;
+    if (!name || !url) return;
+    // Prefer the actual selling price (on sale), else the MSRP
+    const sale = card.querySelector('.ss__result__price');
+    const msrp = card.querySelector('.ss__result__msrp');
+    const txt = ((sale ? sale.textContent : '') + ' ' + (msrp ? msrp.textContent : ''));
+    const m = txt.match(/\$[\d,]+\.?\d*/);
+    if (!m) return;
+    const price = parseFloat(m[0].replace(/[$,]/g, ''));
+    if (!(price > 0)) return;
+    out.push({ name, price, url, prodId: '' });
+  });
+  return out;
+}
+"""
+
+def _wait_scroll_extract(page, settle=1.0):
+    """Wait for product cards to render, scroll to trigger lazy loads, then extract.
+    Returns a list of product dicts (possibly empty)."""
+    import time as _t
+    # Give product elements a chance to appear (non-fatal if they don't)
+    try:
+        page.wait_for_selector(
+            'ul.productGrid, li.product, article.card, [data-product-id], [class*="product"]',
+            timeout=8000)
+    except Exception:
+        pass
+    # Scroll down to trigger any lazy-loaded images/cards, then back up
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        _t.sleep(settle)
+        page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
+    _t.sleep(settle)
+    try:
+        return page.evaluate(EXTRACT_JS)
+    except Exception:
         return []
-    seen = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
-        for slug, platform in categories.items():
-            pg = 1
-            while pg <= max_pages:
-                if "?" in slug:
-                    url = "%s/%s%s" % (base_url, slug, "&page=%d" % pg if pg > 1 else "")
-                else:
-                    url = "%s/%s/" % (base_url, slug)
-                    if pg > 1:
-                        url += "?page=%d" % pg
-                try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    if resp and resp.status >= 400:
-                        if pg == 1:
-                            print("    ! %s returned %d, skipping" % (slug, resp.status))
-                        break
-                except Exception as e:
-                    print("    ! %s page %d error: %s" % (slug, pg, e))
-                    break
-                # Wait for products to render
-                time.sleep(2)
-                try:
-                    page.wait_for_selector('[class*="product"], [class*="Product"], .card, .grid-item', timeout=8000)
-                except:
-                    if pg == 1:
-                        print("    ! %s: no product elements found" % slug)
-                    break
-                # Extract products
-                try:
-                    products = page.evaluate(EXTRACT_JS)
-                except Exception as e:
-                    print("    ! %s extract error: %s" % (slug, e))
-                    break
-                if not products:
-                    break
-                new_on_page = 0
-                for prod in products:
-                    pid_key = prod.get("prodId") or prod["url"].rstrip("/").rsplit("/",1)[-1]
-                    pid = "%s-%s" % (store_id, pid_key)
-                    if pid in seen:
-                        continue
-                    seen[pid] = {
-                        "id": pid,
-                        "name": prod["name"],
-                        "store": store_id,
-                        "platform": platform,
-                        "price": round(prod["price"], 2),
-                        "url": prod["url"],
-                    }
-                    new_on_page += 1
-                if new_on_page == 0:
-                    break  # No new products = we've exhausted this category
-                pg += 1
-                if sleep:
-                    time.sleep(sleep)
-            # Brief log per category
-            cat_count = sum(1 for r in seen.values() if r["platform"] == platform)
-            if cat_count:
-                print("    %s: %d products" % (platform, cat_count))
-        browser.close()
-    return list(seen.values())
+
+def _dump_debug(page, store_id):
+    """Save the current page HTML + report selector match counts, so we can
+    diagnose extraction without guessing. Files land next to run-scraper.bat."""
+    root = os.path.dirname(HERE)
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+    try:
+        with open(os.path.join(root, "debug-%s.html" % store_id), "w", encoding="utf-8") as f:
+            f.write(html)
+        print("    [debug] saved page HTML -> debug-%s.html (%d chars)" % (store_id, len(html)))
+    except Exception as e:
+        print("    [debug] could not save HTML: %s" % e)
+    try:
+        sels = ['ul.productGrid > li','li.product','div.product','article.card',
+                '.product-item','.v-product','[data-product-id]','[data-entity-id]',
+                '.card','[class*="product"]','[class*="Product"]']
+        counts = page.evaluate("(s)=>s.map(x=>x+'='+document.querySelectorAll(x).length)", sels)
+        print("    [debug] selector counts: " + " | ".join(counts))
+    except Exception as e:
+        print("    [debug] selector count failed: %s" % e)
 
 
 # ================================================================ LUKIEGAMES (Shift4Shop)
-LUKIEGAMES_CATEGORIES = {
-    "buy-used-nes-nintendo-games-online": "Nintendo NES",
-    "buy-used-super-nintendo-snes-games-online": "Super Nintendo",
-    "buy-used-nintendo-64-n64": "Nintendo 64",
-    "buy-used-gamecube-games-online": "Nintendo Gamecube",
-    "buy-used-wii-games": "Nintendo Wii",
-    "buy-used-wii-u-games-online": "Wii U",
-    "buy-used-nintendo-switch-games-online": "Nintendo Switch",
-    "buy-used-gameboy-games-online": "Game Boy",
-    "buy-used-gameboy-color-games-online": "Game Boy Color",
-    "buy-used-gameboy-advance-games-online": "Game Boy Advance",
-    "buy-used-nintendo-ds-games-online": "Nintendo DS",
-    "buy-used-nintendo-3ds-games-online": "Nintendo 3DS",
-    "buy-used-playstation-ps1-games-online": "PlayStation 1",
-    "buy-used-playstation-2-ps2-games-online": "PlayStation 2",
-    "buy-used-playstation-3-ps3-games-online": "PlayStation 3",
-    "buy-used-playstation-4-ps4-games-online": "PlayStation 4",
-    "buy-used-psp-games-online": "PlayStation Portable",
-    "buy-used-ps-vita-games-online": "PlayStation Vita",
-    "buy-used-original-xbox-games-online": "Original Xbox",
-    "buy-used-xbox-360-games-online": "Xbox 360",
-    "buy-used-xbox-one-games-online": "Xbox One",
-    "buy-used-sega-genesis-games-online": "Sega Genesis",
-    "buy-used-sega-dreamcast-games-online": "Sega Dreamcast",
-    "buy-used-sega-saturn-games-online": "Sega Saturn",
-    "buy-used-sega-game-gear-games-online": "Sega Game Gear",
-    "buy-used-sega-master-system-games-online": "Sega Master System",
-    "buy-used-atari-2600-games-online": "Atari 2600",
-}
+# We no longer hardcode category URLs. Instead we read the site's own nav menu
+# and match each console to the real link it points to. LG_WANTED maps a platform
+# label to the nav text(s) we accept for it (most specific first).
+LG_WANTED = [
+    ("Nintendo NES",        ["NES Games", "Nintendo NES"]),
+    ("Super Nintendo",      ["SNES Games", "Super Nintendo"]),
+    ("Nintendo 64",         ["N64 Games", "Nintendo 64"]),
+    ("Nintendo Gamecube",   ["Gamecube Games", "Gamecube"]),
+    ("Nintendo Wii",        ["Wii Games", "Nintendo Wii"]),
+    ("Wii U",               ["Wii U"]),
+    ("Game Boy Advance",    ["Gameboy Advance Games", "Gameboy Advance"]),
+    ("Game Boy Color",      ["Gameboy Color Games", "Gameboy Color"]),
+    ("Game Boy",            ["Gameboy"]),
+    ("Nintendo DS",         ["DS Games", "Nintendo DS"]),
+    ("Nintendo 3DS",        ["3DS Games", "Nintendo 3DS"]),
+    ("PlayStation 1",       ["PS1 Games", "Playstation 1"]),
+    ("PlayStation 2",       ["PS2 Games", "Playstation 2"]),
+    ("PlayStation 3",       ["PS3 Games", "Playstation 3"]),
+    ("PlayStation 4",       ["Playstation 4"]),
+    ("PlayStation Portable",["PSP Games", "Sony PSP"]),
+    ("PlayStation Vita",    ["Playstation Vita", "Sony Vita"]),
+    ("Original Xbox",       ["Xbox Games", "Original Xbox"]),
+    ("Xbox 360",            ["Xbox 360 Games", "Xbox 360"]),
+    ("Xbox One",            ["Xbox One"]),
+    ("Sega Genesis",        ["Genesis Games", "Sega Genesis"]),
+    ("Sega Saturn",         ["Sega Saturn"]),
+    ("Sega Dreamcast",      ["Sega Dreamcast"]),
+    ("Sega Game Gear",      ["Sega Game Gear"]),
+    ("Sega Master System",  ["Sega Master System"]),
+]
 
-# Realistic browser fingerprints to rotate between requests
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -420,7 +420,6 @@ def _make_stealth_context(browser, ua=None):
             "Upgrade-Insecure-Requests": "1",
         },
     )
-    # Mask common headless browser signals
     context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -429,8 +428,62 @@ def _make_stealth_context(browser, ua=None):
     """)
     return context
 
-def scrape_lukiegames(sleep=3.0):
-    """Scrape LukieGames with stealth Playwright. Adds long delays to avoid 429."""
+# JS: collect every link's href + visible text from the current page
+DISCOVER_JS = """
+() => {
+  const out = [];
+  document.querySelectorAll('a[href]').forEach(a => {
+    const t = (a.textContent || '').replace(/\\s+/g,' ').trim();
+    if (a.href && t && t.length < 40) out.push({href: a.href, text: t});
+  });
+  return out;
+}
+"""
+
+# JS: find the "next page" link, if any
+NEXT_JS = """
+() => {
+  const cand = [
+    ...document.querySelectorAll('a[rel="next"]'),
+    ...document.querySelectorAll('a.next, a.next-page, .pagination a, .pager a, .pages a')
+  ];
+  for (const a of cand) {
+    const t = (a.textContent||'').trim().toLowerCase();
+    if (a.rel === 'next' || t === 'next' || t === '>' || t === 'next page' || t.includes('next'))
+      return a.href;
+  }
+  return null;
+}
+"""
+
+def _norm(s):
+    return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
+
+def _discover_categories(page, wanted):
+    """Read the site's nav links and map each wanted platform to its real URL.
+    Returns an ordered dict {url: platform_label}."""
+    try:
+        links = page.evaluate(DISCOVER_JS)
+    except Exception:
+        links = []
+    by_text = {}
+    for l in links:
+        key = _norm(l["text"])
+        if key and key not in by_text:
+            by_text[key] = l["href"]
+    found = {}
+    for label, variants in wanted:
+        for v in variants:
+            href = by_text.get(_norm(v))
+            if href and href not in found:
+                found[href] = label
+                break
+    return found
+
+def scrape_lukiegames(sleep=2.0, on_progress=None):
+    """Scrape LukieGames. Discovers category URLs from the nav, then paginates
+    each by following the 'next' link (no guessed URLs).
+    Calls on_progress(list_of_records) after each console so progress is saved."""
     import random
     print("  [lukiegames] scraping with stealth Playwright...")
     if not HAS_PLAYWRIGHT:
@@ -438,116 +491,183 @@ def scrape_lukiegames(sleep=3.0):
     seen = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-        ])
+            "--disable-blink-features=AutomationControlled", "--no-sandbox"])
         context = _make_stealth_context(browser)
         page = context.new_page()
-
-        # Warm up: visit homepage first like a real user would
         try:
             page.goto("https://www.lukiegames.com/", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(random.uniform(2, 4))
-        except:
-            pass
+            time.sleep(random.uniform(1, 2))
+        except Exception as e:
+            print("    ! homepage load failed: %s" % e)
 
-        for slug, platform in LUKIEGAMES_CATEGORIES.items():
-            url = "https://www.lukiegames.com/%s.html" % slug
-            pg = 0
-            while url and pg < 50:
-                pg += 1
-                try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    if resp and resp.status == 429:
-                        print("    ! rate limited on %s, waiting 30s..." % slug)
-                        time.sleep(30)
-                        continue
-                    if resp and resp.status >= 400:
-                        if pg == 1: print("    ! %s returned %d" % (slug, resp.status))
+        categories = _discover_categories(page, LG_WANTED)
+        print("    discovered %d categories from nav" % len(categories))
+        for u, pl in list(categories.items())[:5]:
+            print("      -> %s  (%s)" % (u, pl))
+        if not categories:
+            _dump_debug(page, "lukiegames-home")
+
+        dumped = False
+        for ci, (base_url, platform) in enumerate(categories.items(), 1):
+            print("    [%d/%d] %s ..." % (ci, len(categories), platform))
+            pg = 1
+            throttled_pages = 0
+            while pg <= 60:
+                sep = "&" if "?" in base_url else "?"
+                url = base_url if pg == 1 else "%s%spage=%d" % (base_url, sep, pg)
+                ok, retries = False, 0
+                while retries < 2:
+                    try:
+                        resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        if resp and resp.status == 429:
+                            retries += 1
+                            print("      (throttled, waiting 20s %d/2)" % retries)
+                            time.sleep(20); continue
+                        if resp and resp.status >= 400:
+                            break
+                        ok = True; break
+                    except Exception as e:
+                        print("      ! %s p%d error: %s" % (platform, pg, e)); break
+                if not ok:
+                    throttled_pages += 1
+                    if throttled_pages >= 2:
+                        print("      (giving up on %s after repeated blocks)" % platform)
                         break
-                except Exception as e:
-                    print("    ! %s p%d error: %s" % (slug, pg, e)); break
-
-                # Human-like delay: longer between pages
-                time.sleep(random.uniform(3, 6))
+                    continue
 
                 try:
-                    products = page.evaluate(EXTRACT_JS)
-                except:
-                    break
+                    page.wait_for_selector("article.ss__result, .ss__result--item", timeout=12000)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.6, 1.2))
+                try:
+                    products = page.evaluate(LUKIE_EXTRACT_JS)
+                except Exception:
+                    products = []
+                if not dumped:
+                    _dump_debug(page, "lukiegames"); dumped = True
                 if not products: break
-
                 new_count = 0
                 for prod in products:
-                    pid_key = prod.get("prodId") or prod["url"].rstrip("/").split("/")[-1].replace(".html","")
+                    pid_key = prod["url"].rstrip("/").split("/")[-1].replace(".html","")
                     pid = "lukiegames-%s" % pid_key
                     if pid in seen: continue
                     seen[pid] = {"id":pid,"name":prod["name"],"store":"lukiegames",
                         "platform":platform,"price":round(prod["price"],2),"url":prod["url"]}
                     new_count += 1
-
                 if new_count == 0: break
-
-                # Find next page link
-                next_url = page.evaluate("""
-                    () => {
-                        const candidates = [
-                            ...document.querySelectorAll('a[rel="next"]'),
-                            ...document.querySelectorAll('a.next'),
-                            ...[...document.querySelectorAll('.pagination a, .pager a')]
-                                .filter(a => /next|»|>/i.test(a.textContent))
-                        ];
-                        return candidates.length ? candidates[0].href : null;
-                    }
-                """)
-                url = next_url
-                # Extra pause between pages of same category
-                if url: time.sleep(random.uniform(2, 4))
+                if pg % 3 == 0:
+                    print("      page %d (%d products so far)" % (pg, len(seen)))
+                pg += 1
+                time.sleep(random.uniform(0.4, 0.9))
 
             cat_count = sum(1 for r in seen.values() if r["platform"] == platform)
             if cat_count:
-                print("    %s: %d products" % (platform, cat_count))
-            # Pause between categories
-            time.sleep(random.uniform(2, 5))
-
+                print("    %s: %d products  [running total: %d]" % (platform, cat_count, len(seen)))
+            # Save progress after every console so a hang/cancel never loses it
+            if on_progress:
+                try: on_progress(list(seen.values()))
+                except Exception as e: print("      (progress save skipped: %s)" % e)
+            time.sleep(random.uniform(0.4, 0.9))
         browser.close()
     print("    total: %d products" % len(seen))
     return list(seen.values())
 
 
 # ================================================================ DKOLDIES (BigCommerce)
-# Correct URLs verified from live site navigation
-DKOLDIES_CATEGORIES = {
-    "nintendo-nes":     "Nintendo NES",
-    "super-nintendo":   "Super Nintendo",
-    "nintendo-64":      "Nintendo 64",
-    "gamecube":         "Nintendo Gamecube",
-    "wii":              "Nintendo Wii",
-    "wii-u":            "Wii U",
-    "nintendo-switch":  "Nintendo Switch",
-    "game-boy":         "Game Boy",
-    "game-boy-color":   "Game Boy Color",
-    "game-boy-advance": "Game Boy Advance",
-    "nintendo-ds":      "Nintendo DS",
-    "nintendo-3ds":     "Nintendo 3DS",
-    "playstation-1":    "PlayStation 1",
-    "playstation-2":    "PlayStation 2",
-    "playstation-3":    "PlayStation 3",
-    "playstation-4":    "PlayStation 4",
-    "psp":              "PlayStation Portable",
-    "ps-vita":          "PlayStation Vita",
-    "original-xbox":    "Original Xbox",
-    "xbox-360":         "Xbox 360",
-    "xbox-one":         "Xbox One",
-    "genesis":          "Sega Genesis",
-    "dreamcast":        "Sega Dreamcast",
-    "saturn":           "Sega Saturn",
-    "game-gear":        "Sega Game Gear",
-    "atari":            "Atari",
-}
+DK_WANTED = [
+    ("Nintendo 64",         ["Nintendo 64"]),
+    ("Nintendo NES",        ["Nintendo NES"]),
+    ("Super Nintendo",      ["Super Nintendo"]),
+    ("Nintendo Gamecube",   ["GameCube"]),
+    ("Nintendo Wii",        ["Wii"]),
+    ("Wii U",               ["Wii U"]),
+    ("Nintendo Switch",     ["Nintendo Switch", "Switch"]),
+    ("Game Boy Advance",    ["GameBoy Advance"]),
+    ("Game Boy Color",      ["GameBoy Color"]),
+    ("Game Boy",            ["GameBoy"]),
+    ("Nintendo DS",         ["Nintendo DS", "DS"]),
+    ("Nintendo 3DS",        ["Nintendo 3DS", "3DS"]),
+    ("PlayStation 1",       ["PlayStation 1"]),
+    ("PlayStation 2",       ["PlayStation 2"]),
+    ("PlayStation 3",       ["PlayStation 3"]),
+    ("PlayStation 4",       ["PlayStation 4"]),
+    ("PlayStation 5",       ["PlayStation 5"]),
+    ("PlayStation Portable",["PlayStation Portable", "PSP"]),
+    ("PlayStation Vita",    ["PS Vita"]),
+    ("Original Xbox",       ["Original Xbox"]),
+    ("Xbox 360",            ["Xbox 360"]),
+    ("Xbox One",            ["Xbox One"]),
+    ("Sega Genesis",        ["Genesis"]),
+    ("Sega Dreamcast",      ["Dreamcast"]),
+    ("Sega Saturn",         ["Saturn"]),
+    ("Sega Game Gear",      ["Game Gear"]),
+    ("Atari",               ["Atari 2600", "Atari"]),
+]
 
-def scrape_dkoldies(sleep=3.0):
-    """Scrape DKOldies with stealth Playwright. BigCommerce paginates via ?page=N."""
+# DKOldies loads products from its own SearchSpring API. We call it from inside
+# the page (same origin -> no CORS issue), reusing the site's get_cat_hierarchy().
+DK_API_JS = r"""
+(pageNum) => {
+  return (async () => {
+    let cat = [];
+    try { if (typeof get_cat_hierarchy === 'function') cat = get_cat_hierarchy(); } catch (e) {}
+    if (!cat || !cat.length) {
+      cat = [...document.querySelectorAll('li.breadcrumb')]
+        .map(li => (li.textContent || '').trim())
+        .filter(t => t && t.toLowerCase() !== 'home');
+    }
+    let pageurl = window.location.href.split('?')[0].split('#')[0];
+    if (pageNum > 1) pageurl += '?page=' + pageNum;
+    const params = new URLSearchParams();
+    params.set('pageurl', pageurl);
+    (cat || []).forEach(c => params.append('data_cat_hirarchey[]', c));
+    params.set('per_page', '48');
+    let status = 0, html = '', err = '';
+    try {
+      const r = await fetch('https://inventory.dkoldies.com/admin/searchspring?' + params.toString(),
+                            { headers: { 'Accept': 'application/json' }, credentials: 'omit' });
+      status = r.status;
+      const j = await r.json();
+      html = j.productData || '';
+    } catch (e) { err = String(e); }
+    return { status, err, html, cat };
+  })();
+}
+"""
+
+# Extract products from the API's returned HTML (injected into a hidden container).
+DK_EXTRACT_JS = r"""
+(html) => {
+  let box = document.getElementById('ss-api-extract');
+  if (!box) { box = document.createElement('div'); box.id = 'ss-api-extract';
+              box.style.display = 'none'; document.body.appendChild(box); }
+  box.innerHTML = html;
+  const out = [], seen = new Set();
+  box.querySelectorAll('a[href]').forEach(a => {
+    const href = a.href;
+    if (!/dkoldies\.com\//.test(href)) return;
+    if (/-games\/?($|\?)/.test(href)) return;          // skip category links
+    let el = a, price = null, hops = 0;
+    while (el && hops < 4) {
+      const m = (el.textContent || '').match(/\$[\d,]+\.?\d*/);
+      if (m) { price = parseFloat(m[0].replace(/[$,]/g, '')); break; }
+      el = el.parentElement; hops++;
+    }
+    if (!price || !(price > 0)) return;
+    const name = (a.textContent || '').trim();
+    if (!name || name.length < 2) return;
+    if (seen.has(href)) return;
+    seen.add(href);
+    out.push({ name, price, url: href });
+  });
+  return out;
+}
+"""
+
+def scrape_dkoldies(sleep=2.0, on_progress=None):
+    """Scrape DKOldies. Discovers category URLs from nav, paginates via ?page=N.
+    Calls on_progress(list_of_records) after each console so progress is saved."""
     import random
     print("  [dkoldies] scraping with stealth Playwright...")
     if not HAS_PLAYWRIGHT:
@@ -555,66 +675,113 @@ def scrape_dkoldies(sleep=3.0):
     seen = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-        ])
+            "--disable-blink-features=AutomationControlled", "--no-sandbox"])
         context = _make_stealth_context(browser)
         page = context.new_page()
-
-        # Warm up on homepage first
         try:
             page.goto("https://www.dkoldies.com/", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(random.uniform(3, 5))
-        except:
-            pass
+            time.sleep(random.uniform(1, 2))
+        except Exception as e:
+            print("    ! homepage load failed: %s" % e)
 
-        for slug, platform in DKOLDIES_CATEGORIES.items():
+        categories = _discover_categories(page, DK_WANTED)
+        print("    discovered %d category hubs from nav" % len(categories))
+        if not categories:
+            _dump_debug(page, "dkoldies-home")
+
+        # The nav links point at category HUB pages (e.g. /nintendo-64/) which only
+        # show subcategory tiles. The real product lists are the "-games" pages
+        # (e.g. /n64-games/). From each hub we find its games-listing link.
+        GAMES_LINK_JS = """
+        () => {
+          const bad = /rare-games|sell-your-games|sell-games/;
+          const a = [...document.querySelectorAll('a[href]')].find(a =>
+            /dkoldies\\.com\\/[a-z0-9-]+-games\\/?$/.test(a.href) && !bad.test(a.href));
+          return a ? a.href : null;
+        }
+        """
+
+        dumped = False
+        for ci, (hub_url, platform) in enumerate(categories.items(), 1):
+            print("    [%d/%d] %s ..." % (ci, len(categories), platform))
+            # Step 1: open the hub, locate its games-listing page
+            try:
+                page.goto(hub_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(0.6, 1.2))
+                games_url = page.evaluate(GAMES_LINK_JS)
+            except Exception as e:
+                print("      ! %s hub error: %s" % (platform, e)); games_url = None
+            if not games_url:
+                games_url = hub_url
+
+            # Step 2: load the games page once (gives us breadcrumbs + the site's
+            # own get_cat_hierarchy()), then call DKOldies' SearchSpring API
+            # directly for each page. Products come back as HTML in result.productData.
+            try:
+                page.goto(games_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(0.8, 1.4))
+            except Exception as e:
+                print("      ! %s games page error: %s" % (platform, e)); 
+                if on_progress:
+                    try: on_progress(list(seen.values()))
+                    except Exception: pass
+                continue
+
             pg = 1
-            while pg <= 50:
-                url = "https://www.dkoldies.com/%s/" % slug
-                if pg > 1:
-                    url += "?page=%d" % pg
+            while pg <= 60:
                 try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    if resp and resp.status == 403:
-                        print("    ! %s still blocked (403), skipping" % slug)
-                        break
-                    if resp and resp.status >= 400:
-                        if pg == 1: print("    ! %s returned %d" % (slug, resp.status))
-                        break
+                    res = page.evaluate(DK_API_JS, pg)
                 except Exception as e:
-                    print("    ! %s p%d: %s" % (slug, pg, e)); break
+                    print("      ! %s api error p%d: %s" % (platform, pg, e)); break
 
-                time.sleep(random.uniform(3, 5))
+                html = (res or {}).get("html", "")
+                if pg == 1 and not dumped:
+                    # Save the raw API product HTML so we can verify the markup
+                    try:
+                        root = os.path.dirname(HERE)
+                        with open(os.path.join(root, "debug-dkoldies-api.html"), "w", encoding="utf-8") as f:
+                            f.write("<!-- status=%s cat=%s -->\n%s" % (res.get("status"), res.get("cat"), html))
+                        print("      [debug] API status=%s, productData=%d chars -> debug-dkoldies-api.html"
+                              % (res.get("status"), len(html)))
+                    except Exception as e:
+                        print("      [debug] could not save api html: %s" % e)
+                    dumped = True
 
-                try:
-                    products = page.evaluate(EXTRACT_JS)
-                except:
+                if not html:
                     break
-                if not products: break
+                # Inject the returned product HTML and extract from it
+                try:
+                    products = page.evaluate(DK_EXTRACT_JS, html)
+                except Exception:
+                    products = []
+                if not products:
+                    break
 
                 new_count = 0
                 for prod in products:
-                    pid_key = prod.get("prodId") or prod["url"].rstrip("/").rsplit("/",1)[-1]
+                    pid_key = prod["url"].rstrip("/").rsplit("/", 1)[-1]
                     pid = "dkoldies-%s" % pid_key
                     if pid in seen: continue
                     seen[pid] = {"id":pid,"name":prod["name"],"store":"dkoldies",
                         "platform":platform,"price":round(prod["price"],2),"url":prod["url"]}
                     new_count += 1
-
-                if new_count == 0: break
+                if new_count == 0:
+                    break
+                if pg % 3 == 0:
+                    print("      page %d (%d products so far)" % (pg, len(seen)))
                 pg += 1
-                time.sleep(random.uniform(2, 4))
+                time.sleep(random.uniform(0.4, 0.9))
 
             cat_count = sum(1 for r in seen.values() if r["platform"] == platform)
             if cat_count:
-                print("    %s: %d products" % (platform, cat_count))
-            time.sleep(random.uniform(2, 5))
-
+                print("    %s: %d products  [running total: %d]" % (platform, cat_count, len(seen)))
+            if on_progress:
+                try: on_progress(list(seen.values()))
+                except Exception as e: print("      (progress save skipped: %s)" % e)
+            time.sleep(random.uniform(0.4, 0.9))
         browser.close()
     print("    total: %d products" % len(seen))
     return list(seen.values())
-
 
 # ================================================================ SHARED PIPELINE
 def load_history(path):
@@ -632,6 +799,20 @@ def apply_prev(records, history):
         r["prev"] = history.get(r["id"])
     return records
 
+def load_existing_records(path):
+    """Read the current window.RETRO_DATA out of an existing retro-data.js so we
+    can preserve stores we are NOT scraping in this run (merge, don't clobber)."""
+    if not os.path.exists(path):
+        return []
+    try:
+        txt = open(path, encoding="utf-8").read()
+        m = re.search(r"window\.RETRO_DATA\s*=\s*(\[.*?\]);", txt, re.S)
+        if not m:
+            return []
+        return json.loads(m.group(1))
+    except Exception:
+        return []
+
 def write_data_js(records, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     stamp = datetime.datetime.now().isoformat(timespec="minutes")
@@ -646,27 +827,52 @@ def write_data_js(records, path):
     with open(path, "w", encoding="utf-8") as f: f.write(body)
 
 def run(data_path=DATA_JS_PATH, history_path=HISTORY_PATH, sleep=1.0, scrapers=None):
+    print("=== Retro Price Watch scraper %s ===" % SCRAPER_VERSION)
     if scrapers is None:
         scrapers = [scrape_retrofam, scrape_retrovgames, scrape_lukiegames, scrape_dkoldies]
     history = load_history(history_path)
+
+    def save_snapshot(records):
+        """Merge the given records with existing data for OTHER stores, then write
+        to disk immediately. Safe to call repeatedly mid-run, so progress from each
+        console is persisted and a hang or cancel never loses completed work."""
+        recs = apply_prev(list(records), history)
+        fresh = set(r["store"] for r in recs)
+        kept = [r for r in load_existing_records(data_path) if r["store"] not in fresh]
+        merged = kept + recs
+        merged.sort(key=lambda r: (r["store"], r["platform"], r["name"].lower()))
+        write_data_js(merged, data_path)
+        save_history(merged, history_path)
+        return merged
+
     all_records = []
     for scraper in scrapers:
         try:
-            records = scraper(sleep=sleep)
+            params = inspect.signature(scraper).parameters
+            if "on_progress" in params:
+                records = scraper(sleep=sleep, on_progress=save_snapshot)
+            else:
+                records = scraper(sleep=sleep)
             all_records.extend(records)
             print("  -> %d from %s" % (len(records), scraper.__name__))
+            # Persist after each store so a later store can't lose an earlier one
+            save_snapshot(all_records)
         except Exception as e:
             print("  !! %s FAILED: %s" % (scraper.__name__, e))
             import traceback; traceback.print_exc()
-    all_records = apply_prev(all_records, history)
-    all_records.sort(key=lambda r: (r["store"], r["platform"], r["name"].lower()))
-    write_data_js(all_records, data_path)
-    save_history(all_records, history_path)
-    drops = sum(1 for r in all_records if r["prev"] and r["price"] < r["prev"])
-    new = sum(1 for r in all_records if r["prev"] is None)
+            # Still save whatever we have so far
+            if all_records:
+                save_snapshot(all_records)
+
+    merged = save_snapshot(all_records)
+    drops = sum(1 for r in merged if r["prev"] and r["price"] < r["prev"])
+    new = sum(1 for r in merged if r["prev"] is None)
+    if merged:
+        kept_stores = sorted(set(r["store"] for r in merged))
+        print("  (final data covers: %s)" % ", ".join(kept_stores))
     print("\nTotal: %d products | %d drops | %d new | data -> %s"
-          % (len(all_records), drops, new, data_path))
-    return all_records
+          % (len(merged), drops, new, data_path))
+    return merged
 
 
 # ================================================================ SELF-TEST
@@ -706,5 +912,19 @@ def self_test():
         print("  %-18s %-12s $%-7.2f prev=%-8s chg=%s" % (r["name"],r["store"],r["price"],r["prev"],chg))
 
 if __name__ == "__main__":
-    if "--self-test" in sys.argv: self_test()
-    else: run()
+    if "--self-test" in sys.argv:
+        self_test()
+    else:
+        all_scrapers = {
+            "retrofam":    scrape_retrofam,
+            "retrovgames": scrape_retrovgames,
+            "lukiegames":  scrape_lukiegames,
+            "dkoldies":    scrape_dkoldies,
+        }
+        if "--stores" in sys.argv:
+            idx = sys.argv.index("--stores")
+            names = sys.argv[idx+1:]
+            chosen = [all_scrapers[n] for n in names if n in all_scrapers]
+        else:
+            chosen = list(all_scrapers.values())
+        run(scrapers=chosen)
