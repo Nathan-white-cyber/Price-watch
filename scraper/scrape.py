@@ -610,23 +610,22 @@ DK_WANTED = [
 DK_API_JS = r"""
 (pageNum) => {
   return (async () => {
-    let cat = [];
-    try { if (typeof get_cat_hierarchy === 'function') cat = get_cat_hierarchy(); } catch (e) {}
-    if (!cat || !cat.length) {
-      cat = [...document.querySelectorAll('li.breadcrumb')]
-        .map(li => (li.textContent || '').trim())
-        .filter(t => t && t.toLowerCase() !== 'home');
-    }
+    // The SearchSpring API needs the category hierarchy to return THIS category's
+    // products; pageurl alone returns a default/bestseller set. Build the hierarchy
+    // from the page breadcrumbs (e.g. ["Nintendo","Nintendo 64","N64 Games"]).
+    let cat = [...document.querySelectorAll('li.breadcrumb, .breadcrumb, nav.breadcrumbs li, .breadcrumbs li')]
+      .map(li => (li.textContent || '').trim())
+      .filter(t => t && t.toLowerCase() !== 'home');
     let pageurl = window.location.href.split('?')[0].split('#')[0];
     if (pageNum > 1) pageurl += '?page=' + pageNum;
     const params = new URLSearchParams();
     params.set('pageurl', pageurl);
-    (cat || []).forEach(c => params.append('data_cat_hirarchey[]', c));
+    cat.forEach(c => params.append('data_cat_hirarchey[]', c));
     params.set('per_page', '48');
     let status = 0, html = '', err = '';
     try {
       const r = await fetch('https://inventory.dkoldies.com/admin/searchspring?' + params.toString(),
-                            { headers: { 'Accept': 'application/json' }, credentials: 'omit' });
+                            { headers: { 'Accept': 'application/json' } });
       status = r.status;
       const j = await r.json();
       html = j.productData || '';
@@ -644,19 +643,30 @@ DK_EXTRACT_JS = r"""
               box.style.display = 'none'; document.body.appendChild(box); }
   box.innerHTML = html;
   const out = [], seen = new Set();
-  box.querySelectorAll('a[href]').forEach(a => {
-    const href = a.href;
-    if (!/dkoldies\.com\//.test(href)) return;
-    if (/-games\/?($|\?)/.test(href)) return;          // skip category links
-    let el = a, price = null, hops = 0;
-    while (el && hops < 4) {
-      const m = (el.textContent || '').match(/\$[\d,]+\.?\d*/);
-      if (m) { price = parseFloat(m[0].replace(/[$,]/g, '')); break; }
-      el = el.parentElement; hops++;
+  // Products are BigCommerce cards; each product is one li.product (with a
+  // nested article.card). Iterate the cards, not raw anchors, so we read the
+  // real product name from the title/image rather than a "Choose Options" button.
+  let cards = box.querySelectorAll('li.product');
+  if (!cards.length) cards = box.querySelectorAll('article.card');
+  cards.forEach(card => {
+    const a = card.querySelector('a[href*="dkoldies.com"]');
+    if (!a) return;
+    const href = a.href.split('#')[0].split('?')[0];
+    if (/-games\/?$/.test(href)) return;          // skip any category link
+    // Name: product title link, else the product image's alt/title attribute.
+    let name = '';
+    const titleEl = card.querySelector('.card-title, h3 a, h4 a, .card-title a, [class*="title"]');
+    if (titleEl) name = (titleEl.textContent || '').trim();
+    if (!name || /choose options|quick view|add to cart/i.test(name)) {
+      const img = card.querySelector('img[alt], img[title]');
+      if (img) name = (img.getAttribute('alt') || img.getAttribute('title') || '').trim();
     }
-    if (!price || !(price > 0)) return;
-    const name = (a.textContent || '').trim();
     if (!name || name.length < 2) return;
+    // Price: first $ amount inside the card.
+    const m = (card.textContent || '').match(/\$[\d,]+\.?\d*/);
+    if (!m) return;
+    const price = parseFloat(m[0].replace(/[$,]/g, ''));
+    if (!(price > 0)) return;
     if (seen.has(href)) return;
     seen.add(href);
     out.push({ name, price, url: href });
@@ -674,13 +684,20 @@ def scrape_dkoldies(sleep=2.0, on_progress=None):
         print("    Playwright not installed, skipping"); return []
     seen = {}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
-            "--disable-blink-features=AutomationControlled", "--no-sandbox"])
-        context = _make_stealth_context(browser)
+        # DKOldies isn't bot-blocking us (a plain browser gets full API results
+        # every time), but the stealth context's injected scripts/headers make the
+        # in-page fetch throw "Failed to fetch". So use a plain context here, and
+        # a visible browser (headless requests to its product API return status 0).
+        browser = p.chromium.launch(headless=False, args=["--no-sandbox"])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900},
+        )
         page = context.new_page()
         try:
             page.goto("https://www.dkoldies.com/", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(random.uniform(1, 2))
+            time.sleep(random.uniform(2, 3))
         except Exception as e:
             print("    ! homepage load failed: %s" % e)
 
@@ -719,7 +736,7 @@ def scrape_dkoldies(sleep=2.0, on_progress=None):
             # directly for each page. Products come back as HTML in result.productData.
             try:
                 page.goto(games_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(random.uniform(0.8, 1.4))
+                time.sleep(random.uniform(2.5, 3.5))
             except Exception as e:
                 print("      ! %s games page error: %s" % (platform, e)); 
                 if on_progress:
@@ -740,7 +757,7 @@ def scrape_dkoldies(sleep=2.0, on_progress=None):
                     try:
                         root = os.path.dirname(HERE)
                         with open(os.path.join(root, "debug-dkoldies-api.html"), "w", encoding="utf-8") as f:
-                            f.write("<!-- status=%s cat=%s -->\n%s" % (res.get("status"), res.get("cat"), html))
+                            f.write("<!-- status=%s err=%s cat=%s -->\n%s" % (res.get("status"), res.get("err"), res.get("cat"), html))
                         print("      [debug] API status=%s, productData=%d chars -> debug-dkoldies-api.html"
                               % (res.get("status"), len(html)))
                     except Exception as e:
